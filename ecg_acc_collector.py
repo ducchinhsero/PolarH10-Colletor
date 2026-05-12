@@ -100,7 +100,8 @@ ACC_STOP = bytearray([0x03, TYPE_ACC])
 
 # Window feature extraction
 WIN_SEC   = 30    # giây mỗi window
-STEP_SEC  = 30    # không overlap để tránh data leakage khi train
+STEP_SEC  = 5     # overlap để không bỏ lỡ impact té ngã ngắn
+BUFFER_KEEP_SEC = 600  # giữ 10 phút gần nhất trong RAM; raw data vẫn lưu CSV
 
 # ════════════════════════════════════════════════════════════════
 #  NGƯỠNG HR THEO HOẠT ĐỘNG (người cao tuổi ≥60t)
@@ -122,6 +123,10 @@ ACC_VM_STD_THRESHOLDS = {
     300 : "WALK",
     # > 300 → ACTIVE
 }
+
+FALL_IMPACT_THRESHOLD_MG = 1200      # Reduzido de 1500 (típico: 800-1200 mG)
+FALL_FREE_FALL_THRESHOLD_MG = 400   # Reduzido de 500 (sensibilidade melhorada)
+FALL_POST_STILL_STD_MG = 100        # Aumentado de 30 (realista: 80-150 mG após queda)
 
 # ════════════════════════════════════════════════════════════════
 #  GLOBAL BUFFERS
@@ -173,8 +178,14 @@ WIN_COLS = [
     "acc_energy",
     # Activity & anomaly
     "activity_state",
-    "fall_spike",      # 1 nếu VM_max > 3000 mG
+    "fall_spike",      # 1 nếu có impact spike > ngưỡng
+    "free_fall",       # 1 nếu có pha gần rơi tự do trước impact
     "post_still",      # 1 nếu bất động sau spike
+    "fall_candidate",  # 1 nếu impact + (free_fall hoặc post_still)
+    "strong_fall",     # 1 nếu impact + free_fall + post_still
+    "fall_peak_vm",
+    "fall_min_before_1s",
+    "fall_std_after_5s",
     # Context-aware HR alert
     "hr_context_alert",     # SAFE/WATCH/ALERT/CRITICAL theo activity
     "hr_context_threshold", # ngưỡng HR đã áp dụng
@@ -275,7 +286,13 @@ def parse_acc_packet(data: bytes) -> tuple[int, list[tuple]]:
 
 def parse_hr_gatt(data: bytes) -> dict:
     """Parse GATT 0x2A37 Heart Rate Measurement."""
+    if len(data) < 2:
+        return {"hr": 0, "rr": []}
+
     flags  = data[0]; offset = 1
+    if flags & 0x01 and len(data) < offset + 2:
+        return {"hr": 0, "rr": []}
+
     hr = (int.from_bytes(data[offset:offset+2],"little"),offset:=offset+2)[0] \
          if flags & 0x01 \
          else (data[offset], offset:=offset+1)[0]
@@ -293,10 +310,26 @@ def parse_hr_gatt(data: bytes) -> dict:
 # ════════════════════════════════════════════════════════════════
 _pkt_idx_ecg = 0
 _pkt_idx_acc = 0
+_last_prune = 0.0
+
+
+def _drop_old_samples(buf: list, cutoff: float) -> None:
+    idx = 0
+    n = len(buf)
+    while idx < n and buf[idx][0] < cutoff:
+        idx += 1
+    if idx:
+        del buf[:idx]
+
+
+def prune_runtime_buffers(now: float) -> None:
+    cutoff = now - BUFFER_KEEP_SEC
+    for buf in (ecg_buf, acc_buf, rr_buf, hr_buf):
+        _drop_old_samples(buf, cutoff)
 
 def pmd_callback(sender, data: bytearray):
     """Router: phân loại ECG hay ACC và xử lý."""
-    global _pkt_idx_ecg, _pkt_idx_acc
+    global _pkt_idx_ecg, _pkt_idx_acc, _last_prune
     raw = bytes(data)
     if not raw:
         return
@@ -314,6 +347,9 @@ def pmd_callback(sender, data: bytearray):
                 w_ecg.writerow([f"{t_unix:.6f}", ts_ns + i*dt_ns,
                                  _pkt_idx_ecg, s])
             _pkt_idx_ecg += len(samples)
+            if now - _last_prune > 5:
+                prune_runtime_buffers(now)
+                _last_prune = now
         f_ecg.flush()
 
     elif data_type == TYPE_ACC:    # ACC packet
@@ -327,6 +363,9 @@ def pmd_callback(sender, data: bytearray):
                 w_acc.writerow([f"{t_unix:.6f}", ts_ns + i*dt_ns,
                                  _pkt_idx_acc, x, y, z, round(vm, 2)])
             _pkt_idx_acc += len(samples)
+            if now - _last_prune > 5:
+                prune_runtime_buffers(now)
+                _last_prune = now
         f_acc.flush()
 
 
@@ -344,12 +383,16 @@ def pmd_control_callback(sender, data: bytearray):
 
 
 def hr_callback(sender, data: bytearray):
+    global _last_prune
     parsed = parse_hr_gatt(bytes(data))
     now    = time.time()
     with buf_lock:
         hr_buf.append((now, parsed["hr"]))
         for rr in parsed["rr"]:
             rr_buf.append((now, rr))
+        if now - _last_prune > 5:
+            prune_runtime_buffers(now)
+            _last_prune = now
 
 
 # ════════════════════════════════════════════════════════════════
@@ -363,26 +406,59 @@ def classify_activity(vm_std: float) -> str:
     return "ACTIVE"
 
 
-def detect_fall(vm_array: np.ndarray) -> tuple[bool, bool]:
+def detect_fall(vm_array: np.ndarray) -> dict:
     """
-    Phát hiện ngã:
-    - fall_spike : VM_max > 3000 mG (impact)
-    - post_still : VM_std < 10 mG trong 5s sau spike (bất động)
+    Phát hiện ngã theo tín hiệu thô và mức suy luận:
+    - impact_spike: VM_max > FALL_IMPACT_THRESHOLD_MG
+    - free_fall: có mẫu VM < FALL_FREE_FALL_THRESHOLD_MG trong 1s trước impact
+    - post_still: VM_std thấp trong 5s sau impact
+    - fall_candidate: impact + (free_fall hoặc post_still)
+    - strong_fall: impact + free_fall + post_still
     """
+    result = {
+        "impact_spike": False,
+        "free_fall": False,
+        "post_still": False,
+        "fall_candidate": False,
+        "strong_fall": False,
+        "peak_vm": 0.0,
+        "min_before_1s": 0.0,
+        "std_after_5s": 0.0,
+    }
+
     if len(vm_array) < 5:
-        return False, False
+        return result
 
-    fall_spike = bool(np.max(vm_array) > 3000)
+    spike_idx = int(np.argmax(vm_array))
+    peak_vm = float(vm_array[spike_idx])
+    result["peak_vm"] = round(peak_vm, 2)
+    impact_spike = bool(peak_vm > FALL_IMPACT_THRESHOLD_MG)
+    result["impact_spike"] = impact_spike
 
-    post_still = False
-    if fall_spike:
-        spike_idx = np.argmax(vm_array)
+    if impact_spike:
+        before_1s_idx = max(0, spike_idx - int(FS_ACC * 1))
+        before_arr = vm_array[before_1s_idx : spike_idx]
+        if len(before_arr) > 0:
+            result["min_before_1s"] = round(float(np.min(before_arr)), 2)
+        result["free_fall"] = bool(
+            len(before_arr) > 0 and np.min(before_arr) < FALL_FREE_FALL_THRESHOLD_MG
+        )
+
         after_5s  = int(FS_ACC * 5)
-        after_arr = vm_array[spike_idx : spike_idx + after_5s]
+        after_arr = vm_array[spike_idx + 1 : spike_idx + 1 + after_5s]
         if len(after_arr) >= int(FS_ACC * 2):
-            post_still = bool(np.std(after_arr) < 10)
+            std_after_5s = float(np.std(after_arr))
+            result["std_after_5s"] = round(std_after_5s, 2)
+            result["post_still"] = bool(std_after_5s < FALL_POST_STILL_STD_MG)
 
-    return fall_spike, post_still
+    result["fall_candidate"] = bool(
+        result["impact_spike"] and (result["free_fall"] or result["post_still"])
+    )
+    result["strong_fall"] = bool(
+        result["impact_spike"] and result["free_fall"] and result["post_still"]
+    )
+
+    return result
 
 
 # ════════════════════════════════════════════════════════════════
@@ -524,26 +600,44 @@ def extract_window():
             row["acc_z_std"] = round(float(np.std(zs)), 2)
 
         activity = classify_activity(vm_std)
-        fall_sp, post_st = detect_fall(acc_w)
+        fall = detect_fall(acc_w)
 
         row["activity_state"]       = activity
-        row["fall_spike"]           = int(fall_sp)
-        row["post_still"]           = int(post_st)
+        row["fall_spike"]           = int(fall["impact_spike"])
+        row["free_fall"]            = int(fall["free_fall"])
+        row["post_still"]           = int(fall["post_still"])
+        row["fall_candidate"]       = int(fall["fall_candidate"])
+        row["strong_fall"]          = int(fall["strong_fall"])
+        row["fall_peak_vm"]         = fall["peak_vm"]
+        row["fall_min_before_1s"]   = fall["min_before_1s"]
+        row["fall_std_after_5s"]    = fall["std_after_5s"]
 
         # ── Context-aware HR alert ─────────────────────────
+        alert, reason = ("SAFE", "")
         if hr_mean > 0:
             alert, reason = context_hr_alert(hr_mean, activity)
-            # Override: ngã luôn CRITICAL
-            if fall_sp and post_st:
-                alert  = "CRITICAL"
-                reason = "Phát hiện ngã (ACC spike + bất động)"
 
-            row["hr_context_alert"]     = alert
-            row["hr_context_threshold"] = ACTIVITY_HR_THRESHOLDS.get(
-                activity, ACTIVITY_HR_THRESHOLDS["UNKNOWN"]
-            )[2]   # high_alert threshold
+        # Override theo mức tin cậy của phát hiện ngã.
+        # Nếu impact đủ mạnh + có dấu hiệu free-fall/stillness -> cảnh báo
+        # NÂNG CẤP: Impact > 1200 mG + bất kỳ dấu hiệu nào -> cảnh báo ngay
+        if fall["strong_fall"]:
+            alert  = "CRITICAL"
+            reason = "Phát hiện ngã mạnh (impact + free-fall + bất động)"
+        elif fall["fall_candidate"]:
+            alert  = "ALERT"
+            reason = "Nghi ngờ ngã (impact + dấu hiệu rơi tự do/bất động)"
+        elif fall["impact_spike"] and vm_std > 150:
+            # Thêm logic: impact mạnh + chuyển động lớn -> ngã trượt
+            alert  = "ALERT"
+            reason = "Phát hiện impact cao (có thể ngã trượt/va chạm)"
 
-            # Ghi log realtime
+        row["hr_context_alert"]     = alert
+        row["hr_context_threshold"] = ACTIVITY_HR_THRESHOLDS.get(
+            activity, ACTIVITY_HR_THRESHOLDS["UNKNOWN"]
+        )[2] if hr_mean > 0 else ""
+
+        # Ghi log realtime khi có HR context hoặc nghi ngờ ngã.
+        if hr_mean > 0 or fall["fall_candidate"]:
             rmssd_val = hrv.get("rmssd", 0) if len(rr_w) >= 5 else 0
             w_log.writerow({
                 "timestamp"   : row["timestamp"],
@@ -577,8 +671,8 @@ ALERT_COLORS = {
 RESET = "\033[0m"
 
 def display_loop():
+    global last_row
     start = time.time()
-    last_row = {}
     while is_running:
         time.sleep(2)
         now     = time.time()
@@ -609,10 +703,16 @@ def display_loop():
         print(f"  ❤  HR          : {hr_v} BPM")
         print(f"  🏃 Activity    : {activity}  (VM_std={vm_std:.0f} mG)")
         print(f"  ⚡ Alert       : {alert_c}{alert_l}{RESET}")
-        if last_row.get("hr_context_alert") == "SAFE":
+        if not hr_buf:
+            print("     HR characteristic chưa hoạt động; vẫn thu ECG/ACC")
+        elif last_row.get("hr_context_alert") == "SAFE":
             print(f"     HR {hr_v} BPM trong ngưỡng bình thường khi {activity}")
         else:
-            print(f"     {last_row.get('hr_context_threshold','')} BPM ngưỡng cho {activity}")
+            threshold = last_row.get("hr_context_threshold", "")
+            if threshold:
+                print(f"     {threshold} BPM ngưỡng cho {activity}")
+            else:
+                print(f"     Theo dõi cảnh báo theo ACC/HR context")
         print()
         print(f"  📡 ECG samples : {n_ecg:>8,}  ({n_ecg/FS_ECG:.0f}s)")
         print(f"  📡 ACC samples : {n_acc:>8,}  ({n_acc/FS_ACC:.0f}s)")
@@ -669,9 +769,13 @@ async def run_ble():
             async with BleakClient(POLAR_ADDRESS, timeout=20) as client:
                 print("✓ Đã kết nối!\n")
 
-                # HR + RR
-                await client.start_notify(HR_UUID, hr_callback)
-                print("  ✓ HR + RR: ACTIVE")
+                # HR + RR is optional for this collector. Some Windows BLE
+                # sessions expose PMD but not the standard HR characteristic.
+                try:
+                    await client.start_notify(HR_UUID, hr_callback)
+                    print("  ✓ HR + RR: ACTIVE")
+                except Exception as e:
+                    print(f"  ⚠ HR + RR skipped: {e}")
 
                 # Start PMD data notification before START commands so the first
                 # ECG/ACC packets are not missed. PMD_CONTROL notify is optional

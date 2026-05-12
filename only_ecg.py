@@ -154,37 +154,97 @@ def display_stats():
         print("=" * 60)
 
 # ════════════════════════════════════════════════════════════════
+#  SERVICE DISCOVERY
+# ════════════════════════════════════════════════════════════════
+async def discover_services(client):
+    """Log all available services and characteristics"""
+    print("\n  Discovering services...\n")
+    found_pmd_control = False
+    found_pmd_data = False
+    
+    for service in client.services:
+        if "fb005c" in service.uuid.lower():  # Polar PMD Service
+            print(f"  📡 Found PMD Service: {service.uuid}")
+            for char in service.characteristics:
+                char_uuid = char.uuid.lower()
+                print(f"     - {char_uuid} ({', '.join(char.properties)})")
+                if char_uuid == PMD_CONTROL.lower():
+                    found_pmd_control = True
+                if char_uuid == PMD_DATA.lower():
+                    found_pmd_data = True
+    
+    if found_pmd_control and found_pmd_data:
+        print("  ✓ PMD service complete\n")
+        return True
+    else:
+        print(f"  ❌ PMD Service incomplete:")
+        print(f"     PMD_CONTROL found: {found_pmd_control}")
+        print(f"     PMD_DATA found: {found_pmd_data}\n")
+        return False
+
+# ════════════════════════════════════════════════════════════════
 #  BLE ASYNC
 # ════════════════════════════════════════════════════════════════
 async def run_ble():
     global is_running
-    while is_running:
+    retry_count = 0
+    max_retries = 5
+    
+    while is_running and retry_count < max_retries:
         try:
-            print(f"Connecting to {POLAR_ADDRESS}...")
+            print(f"Connecting to {POLAR_ADDRESS}... (attempt {retry_count + 1}/{max_retries})")
             async with BleakClient(POLAR_ADDRESS, timeout=20) as client:
                 print("✓ Connected!")
                 
-                # Chỉ kích hoạt ECG, bỏ qua HR notifications
+                # Discover and verify services
+                services_ok = await discover_services(client)
+                
+                if not services_ok:
+                    print("⚠  Required services not available")
+                    print("  Disconnecting and retrying...\n")
+                    retry_count += 1
+                    await asyncio.sleep(3)
+                    continue
+                
+                # Try to enable ECG
                 try:
                     print("  Starting ECG receiver...")
                     await client.write_gatt_char(PMD_CONTROL, ECG_START_CMD, response=True)
                     await client.start_notify(PMD_DATA, ecg_callback)
                     print("✓ ECG enabled\n")
+                    retry_count = 0  # Reset retry count on success
                 except Exception as e:
-                    print(f"⚠  ECG not available: {e}\n")
-                    is_running = False
-                    break
+                    print(f"⚠  Failed to enable ECG: {e}")
+                    print(f"  Retrying in 5s...\n")
+                    retry_count += 1
+                    await asyncio.sleep(5)
+                    continue
                 
                 while is_running and client.is_connected:
                     await asyncio.sleep(0.5)
         
+        except asyncio.TimeoutError:
+            print(f"⚠  Connection timeout")
+            print(f"  Retrying in 5s...\n")
+            retry_count += 1
+            await asyncio.sleep(5)
         except Exception as e:
             if is_running:
                 print(f"⚠  Connection error: {e}")
-                print("  Retrying in 5s...\n")
+                print(f"  Retrying in 5s...\n")
+                retry_count += 1
                 await asyncio.sleep(5)
             else:
                 break
+    
+    if retry_count >= max_retries:
+        print(f"\n❌ Failed to connect after {max_retries} attempts")
+        print("   Please verify:")
+        print("   1. Polar H10 is powered on (check LED)")
+        print("   2. Polar H10 is within range")
+        print("   3. MAC address is correct: {POLAR_ADDRESS}")
+        print("   4. Run 'python scan_uuids.py' to debug services\n")
+        is_running = False
 
 def run_ble_thread():
     loop = asyncio.new_event_loop()
