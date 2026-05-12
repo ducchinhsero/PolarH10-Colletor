@@ -36,11 +36,20 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from scipy.signal import butter, filtfilt, welch
+    from scipy.signal import butter, filtfilt, welch, find_peaks
     SCIPY_OK = True
 except ImportError:
     SCIPY_OK = False
     print("⚠  scipy chưa cài: pip install scipy")
+    def find_peaks(x, height=None, distance=None):
+        x = np.asarray(x)
+        idx = []
+        for i in range(1, len(x) - 1):
+            if x[i] >= x[i-1] and x[i] >= x[i+1]:
+                if height is None or x[i] >= height:
+                    if not idx or (i - idx[-1]) >= (distance or 1):
+                        idx.append(i)
+        return np.array(idx, dtype=int), {}
 
 from bleak import BleakClient
 
@@ -88,11 +97,13 @@ ECG_START = build_pmd_start(TYPE_ECG, [
     (SETTING_RESOLUTION, 14),
 ])
 
-# Start ACC: 25 Hz, 16-bit, +/-2G.
+# Start ACC: 25 Hz, 16-bit, +/-8G.
+# Té ngã trên ngực thường tạo impact 3-6 G; range ±2G sẽ bị clip ở 2000 mG/trục
+# (đã quan sát trong log: x,y,z chạm ±2000 → VM bị giới hạn ~3464 mG).
 ACC_START = build_pmd_start(TYPE_ACC, [
     (SETTING_SAMPLE_RATE, FS_ACC),
     (SETTING_RESOLUTION, 16),
-    (SETTING_RANGE, 2),
+    (SETTING_RANGE, 8),
 ])
 
 ECG_STOP = bytearray([0x03, TYPE_ECG])
@@ -124,9 +135,18 @@ ACC_VM_STD_THRESHOLDS = {
     # > 300 → ACTIVE
 }
 
-FALL_IMPACT_THRESHOLD_MG = 1200      # Reduzido de 1500 (típico: 800-1200 mG)
-FALL_FREE_FALL_THRESHOLD_MG = 400   # Reduzido de 500 (sensibilidade melhorada)
-FALL_POST_STILL_STD_MG = 100        # Aumentado de 30 (realista: 80-150 mG após queda)
+# Ngưỡng phát hiện ngã. ACC bao gồm trọng lực ⇒ VM nghỉ ≈ 1000 mG.
+#   IMPACT  : đỉnh VM tuyệt đối phải > 2500 mG để loại trừ bước chân/stomp.
+#             Chest-worn IMU với range ±8G có thể đo tới ~8000 mG.
+#   FREE_FALL: VM rơi < 500 mG trong 0.2–0.6 s ngay trước impact.
+#   STILL   : std VM 3 s sau impact < 80 mG (người bất động chỉ còn 1 G ổn định).
+#   FALL_PROX_S: free-fall và impact phải cách nhau ≤ thời gian này.
+FALL_IMPACT_THRESHOLD_MG     = 2000
+FALL_FREE_FALL_THRESHOLD_MG  = 500
+FALL_POST_STILL_STD_MG       = 120
+FALL_PROX_S                  = 1.0   # free-fall–impact tối đa cách 1.0 s
+FALL_ALERT_COOLDOWN_S        = 15    # không lặp alert cùng cú ngã trong 15 s
+FALL_STRONG_IMPACT_MG        = 2800  # ngưỡng để xếp CRITICAL
 
 # ════════════════════════════════════════════════════════════════
 #  GLOBAL BUFFERS
@@ -340,13 +360,16 @@ def pmd_callback(sender, data: bytearray):
         ts_ns, samples = parse_ecg_packet(raw)
         if not samples: return
         dt_ns = int(1e9 / FS_ECG)  # khoảng cách ns giữa mỗi sample
+        n = len(samples)
+        # Sample cuối packet là sample mới nhất ≈ now; sample đầu được lấy
+        # trước đó (n-1)/FS giây. Cần "lùi" về quá khứ.
         with buf_lock:
             for i, s in enumerate(samples):
-                t_unix = now + i / FS_ECG
+                t_unix = now - (n - 1 - i) / FS_ECG
                 ecg_buf.append((t_unix, s))
                 w_ecg.writerow([f"{t_unix:.6f}", ts_ns + i*dt_ns,
                                  _pkt_idx_ecg, s])
-            _pkt_idx_ecg += len(samples)
+            _pkt_idx_ecg += n
             if now - _last_prune > 5:
                 prune_runtime_buffers(now)
                 _last_prune = now
@@ -356,13 +379,14 @@ def pmd_callback(sender, data: bytearray):
         ts_ns, samples = parse_acc_packet(raw)
         if not samples: return
         dt_ns = int(1e9 / FS_ACC)
+        n = len(samples)
         with buf_lock:
             for i, (x, y, z, vm) in enumerate(samples):
-                t_unix = now + i / FS_ACC
+                t_unix = now - (n - 1 - i) / FS_ACC
                 acc_buf.append((t_unix, x, y, z, vm))
                 w_acc.writerow([f"{t_unix:.6f}", ts_ns + i*dt_ns,
                                  _pkt_idx_acc, x, y, z, round(vm, 2)])
-            _pkt_idx_acc += len(samples)
+            _pkt_idx_acc += n
             if now - _last_prune > 5:
                 prune_runtime_buffers(now)
                 _last_prune = now
@@ -408,12 +432,15 @@ def classify_activity(vm_std: float) -> str:
 
 def detect_fall(vm_array: np.ndarray) -> dict:
     """
-    Phát hiện ngã theo tín hiệu thô và mức suy luận:
-    - impact_spike: VM_max > FALL_IMPACT_THRESHOLD_MG
-    - free_fall: có mẫu VM < FALL_FREE_FALL_THRESHOLD_MG trong 1s trước impact
-    - post_still: VM_std thấp trong 5s sau impact
-    - fall_candidate: impact + (free_fall hoặc post_still)
-    - strong_fall: impact + free_fall + post_still
+    Quét toàn bộ window cho chữ ký free-fall → impact → bất động.
+
+    Khác bản trước:
+      • Không dùng argmax (chỉ thấy 1 đỉnh / window — sẽ bỏ sót nhiều cú ngã
+        chồng nhau và lỗi khi đỉnh argmax là bước chân chứ không phải impact).
+      • Quét MỌI peak vượt FALL_IMPACT_THRESHOLD_MG bằng find_peaks.
+      • Free-fall phải xảy ra trong FALL_PROX_S giây ngay trước peak
+        (không phải bất kỳ chỗ nào trong cửa sổ 30 s).
+      • Trả về peak có "điểm tin cậy" cao nhất (free_fall + post_still).
     """
     result = {
         "impact_spike": False,
@@ -424,40 +451,73 @@ def detect_fall(vm_array: np.ndarray) -> dict:
         "peak_vm": 0.0,
         "min_before_1s": 0.0,
         "std_after_5s": 0.0,
+        "n_impacts": 0,
+        "fall_offset_s": -1.0,   # vị trí peak tính từ đầu window, để dedup
     }
 
-    if len(vm_array) < 5:
+    n = len(vm_array)
+    if n < FS_ACC * 3:           # cần tối thiểu 3 s dữ liệu
         return result
 
-    spike_idx = int(np.argmax(vm_array))
-    peak_vm = float(vm_array[spike_idx])
-    result["peak_vm"] = round(peak_vm, 2)
-    impact_spike = bool(peak_vm > FALL_IMPACT_THRESHOLD_MG)
-    result["impact_spike"] = impact_spike
-
-    if impact_spike:
-        before_1s_idx = max(0, spike_idx - int(FS_ACC * 1))
-        before_arr = vm_array[before_1s_idx : spike_idx]
-        if len(before_arr) > 0:
-            result["min_before_1s"] = round(float(np.min(before_arr)), 2)
-        result["free_fall"] = bool(
-            len(before_arr) > 0 and np.min(before_arr) < FALL_FREE_FALL_THRESHOLD_MG
-        )
-
-        after_5s  = int(FS_ACC * 5)
-        after_arr = vm_array[spike_idx + 1 : spike_idx + 1 + after_5s]
-        if len(after_arr) >= int(FS_ACC * 2):
-            std_after_5s = float(np.std(after_arr))
-            result["std_after_5s"] = round(std_after_5s, 2)
-            result["post_still"] = bool(std_after_5s < FALL_POST_STILL_STD_MG)
-
-    result["fall_candidate"] = bool(
-        result["impact_spike"] and (result["free_fall"] or result["post_still"])
+    # Yêu cầu các peak cách nhau >= 0.6 s để không nhặt cùng một cú impact
+    # nhiều lần (impact thật là một burst rất ngắn).
+    peaks, _ = find_peaks(
+        vm_array,
+        height=FALL_IMPACT_THRESHOLD_MG,
+        distance=max(1, int(FS_ACC * 0.6)),
     )
-    result["strong_fall"] = bool(
-        result["impact_spike"] and result["free_fall"] and result["post_still"]
-    )
+    result["n_impacts"] = int(len(peaks))
+    if len(peaks) == 0:
+        return result
 
+    prox = max(1, int(FS_ACC * FALL_PROX_S))
+    after_n = int(FS_ACC * 3)     # 3 s bất động là đủ để khẳng định ngã
+    min_after = int(FS_ACC * 2)   # cần ít nhất 2 s sau peak để tin std
+
+    best_score = -1
+    best = None
+    for pi in peaks:
+        before = vm_array[max(0, pi - prox): pi]
+        if len(before) == 0:
+            continue
+        min_before = float(np.min(before))
+        free_fall = min_before < FALL_FREE_FALL_THRESHOLD_MG
+
+        after = vm_array[pi + 1: pi + 1 + after_n]
+        post_still = False
+        std_after = 0.0
+        if len(after) >= min_after:
+            std_after = float(np.std(after))
+            post_still = std_after < FALL_POST_STILL_STD_MG
+
+        # Điểm tin cậy: ưu tiên cú nào có cả free-fall và bất động.
+        score = (2 if free_fall else 0) + (1 if post_still else 0)
+        # Tie-break bằng peak cao nhất.
+        if score > best_score or (
+            score == best_score and (best is None or vm_array[pi] > vm_array[best[0]])
+        ):
+            best_score = score
+            best = (int(pi), free_fall, post_still, min_before, std_after)
+
+    if best is None:
+        return result
+
+    pi, free_fall, post_still, min_before, std_after = best
+    peak_vm = float(vm_array[pi])
+    result["impact_spike"]   = True
+    result["peak_vm"]        = round(peak_vm, 2)
+    result["free_fall"]      = bool(free_fall)
+    result["post_still"]     = bool(post_still)
+    result["min_before_1s"]  = round(min_before, 2)
+    result["std_after_5s"]   = round(std_after, 2)
+    result["fall_offset_s"]  = round(pi / FS_ACC, 2)
+    # Cốt lõi: free-fall ngay trước impact là chữ ký rất hiếm khi đi bộ/stomp.
+    # Walking peak (2-3 G) KHÔNG đi kèm pha rơi tự do trước đó.
+    # Không yêu cầu post_still vì người ngã có thể còn cử động/giẫy.
+    result["fall_candidate"] = bool(free_fall)
+    result["strong_fall"]    = bool(
+        free_fall and (post_still or peak_vm > FALL_STRONG_IMPACT_MG)
+    )
     return result
 
 
@@ -549,6 +609,32 @@ def extract_hrv(rr_ms: np.ndarray) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════
+#  FALL ALERT STATE — dùng để dedup giữa các overlapping windows
+# ════════════════════════════════════════════════════════════════
+_last_fall_alert_ts: float = 0.0     # unix ts cú alert gần nhất
+_last_fall_event_ts: float = 0.0     # ts của cú té đã alert (đầu peak)
+_fall_alert_count: int = 0
+
+
+def _fire_fall_alert(level: str, reason: str, peak_vm: float) -> None:
+    """Bật chuông + in banner đỏ ra stderr để người trực thấy."""
+    import sys
+    global _fall_alert_count
+    _fall_alert_count += 1
+    bar = "█" * 60
+    msg = (
+        f"\n\033[1;97;41m{bar}\033[0m\n"
+        f"\033[1;97;41m  🚨 FALL ALERT #{_fall_alert_count} — {level}  "
+        f"peak={peak_vm:.0f} mG  \033[0m\n"
+        f"\033[1;91m  {reason}\033[0m\n"
+        f"\033[1;97;41m{bar}\033[0m\n"
+        "\a"   # BEL — system beep
+    )
+    sys.stderr.write(msg)
+    sys.stderr.flush()
+
+
+# ════════════════════════════════════════════════════════════════
 #  WINDOW EXTRACTION — chạy mỗi STEP_SEC giây
 # ════════════════════════════════════════════════════════════════
 def extract_window():
@@ -618,18 +704,35 @@ def extract_window():
             alert, reason = context_hr_alert(hr_mean, activity)
 
         # Override theo mức tin cậy của phát hiện ngã.
-        # Nếu impact đủ mạnh + có dấu hiệu free-fall/stillness -> cảnh báo
-        # NÂNG CẤP: Impact > 1200 mG + bất kỳ dấu hiệu nào -> cảnh báo ngay
+        # Yêu cầu ĐỦ HAI dấu hiệu (free-fall + bất động) cho cảnh báo,
+        # tránh false positive khi đi bộ/đứng yên thở mạnh.
+        global _last_fall_alert_ts, _last_fall_event_ts
+        fall_alert_level = None
         if fall["strong_fall"]:
-            alert  = "CRITICAL"
-            reason = "Phát hiện ngã mạnh (impact + free-fall + bất động)"
+            fall_alert_level = "CRITICAL"
+            reason = (f"Phát hiện ngã mạnh (impact {fall['peak_vm']:.0f} mG "
+                      f"+ free-fall {fall['min_before_1s']:.0f} mG "
+                      f"+ bất động std={fall['std_after_5s']:.0f} mG)")
         elif fall["fall_candidate"]:
-            alert  = "ALERT"
-            reason = "Nghi ngờ ngã (impact + dấu hiệu rơi tự do/bất động)"
-        elif fall["impact_spike"] and vm_std > 150:
-            # Thêm logic: impact mạnh + chuyển động lớn -> ngã trượt
-            alert  = "ALERT"
-            reason = "Phát hiện impact cao (có thể ngã trượt/va chạm)"
+            fall_alert_level = "ALERT"
+            reason = (f"Nghi ngờ ngã (impact {fall['peak_vm']:.0f} mG, "
+                      f"min trước {fall['min_before_1s']:.0f} mG, "
+                      f"std sau {fall['std_after_5s']:.0f} mG)")
+
+        if fall_alert_level:
+            # Quy đổi offset của peak trong window thành ts tuyệt đối, dùng để
+            # biết hai window có đang nói về cùng một cú té không. Cú ngã đi
+            # qua tối đa 6 cửa sổ liên tiếp (WIN_SEC/STEP_SEC) — chỉ alert 1 lần.
+            event_ts = (now - WIN_SEC) + max(0.0, fall["fall_offset_s"])
+            # Cùng cú té xuất hiện trong nhiều cửa sổ chồng nhưng peak_ts gần
+            # giống nhau (±2-3 s). Cooldown thì chặn các cú té khác quá sát.
+            same_event = abs(event_ts - _last_fall_event_ts) <= 3.0
+            in_cooldown = (now - _last_fall_alert_ts) < FALL_ALERT_COOLDOWN_S
+            alert = fall_alert_level
+            if not (same_event or in_cooldown):
+                _last_fall_alert_ts = now
+                _last_fall_event_ts = event_ts
+                _fire_fall_alert(fall_alert_level, reason, fall["peak_vm"])
 
         row["hr_context_alert"]     = alert
         row["hr_context_threshold"] = ACTIVITY_HR_THRESHOLDS.get(
